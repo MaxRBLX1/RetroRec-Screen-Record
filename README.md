@@ -22,6 +22,10 @@ If you love RetroRec, please support the FFmpeg project:
 - ⭐ GitHub: [https://github.com/FFmpeg/FFmpeg](https://github.com/FFmpeg/FFmpeg)
 
 ---
+## Beta Testers
+- Mistery Timmeh aka (agali_74539) In discord
+
+---
 
 ## What is RetroRec?
 
