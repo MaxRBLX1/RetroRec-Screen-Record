@@ -1,6 +1,7 @@
 // RetroRec v1.1 — Universal Ghost Screen Recorder
 // "Every screen deserves to be recorded."
-// Auto-CRF Matrix | Holy Grail Command | Zero Drops
+// Built by MaxRBLX1
+// MJPEG Recording | x264 Post-Convert | Zero Drops | Auto-CRF Matrix
 
 #include <windows.h>
 #include <shellapi.h>
@@ -30,6 +31,7 @@ struct RetroRec {
     HWND progressBar = nullptr;
     PROCESS_INFORMATION ffmpegProcess = {0};
     std::string finalFile;
+    std::string tempFile;
     std::string ffmpegPath;
     std::string outputDir;
     int screenWidth = 1920;
@@ -42,6 +44,8 @@ struct RetroRec {
     std::chrono::steady_clock::time_point recStart;
     int sessions = 0;
     long long totalBytes = 0;
+    int lastRecordingDurationMs = 0;
+    int convertPreset = 0;
 } app;
 
 std::string GetExeDir() {
@@ -99,14 +103,10 @@ bool FindFFmpeg() {
     return false;
 }
 
-// ============================================================
-// READ CUSTOM HOTKEY FROM CONFIG FILE
-// ============================================================
 UINT ReadHotkeyFromConfig() {
     std::string iniPath = GetExeDir() + "\\RetroRec.ini";
     char buf[32];
     GetPrivateProfileStringA("Settings", "Hotkey", "F12", buf, sizeof(buf), iniPath.c_str());
-    
     if (strcmp(buf, "F1") == 0)  return VK_F1;
     if (strcmp(buf, "F2") == 0)  return VK_F2;
     if (strcmp(buf, "F3") == 0)  return VK_F3;
@@ -118,46 +118,27 @@ UINT ReadHotkeyFromConfig() {
     if (strcmp(buf, "F9") == 0)  return VK_F9;
     if (strcmp(buf, "F10") == 0) return VK_F10;
     if (strcmp(buf, "F11") == 0) return VK_F11;
-    return VK_F12;  // Default
+    return VK_F12;
 }
 
-// ============================================================
-// AUTO-DETECT CURRENT DISPLAY RESOLUTION
-// ============================================================
 void DetectCurrentResolution() {
     app.screenWidth = GetSystemMetrics(SM_CXSCREEN);
     app.screenHeight = GetSystemMetrics(SM_CYSCREEN);
 }
 
-// ============================================================
-// UNIVERSAL CPU MATRIX — CRF + Threads + Bitrate per tier
-// ============================================================
 void ConfigureUniversalPipeline() {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     int cores = si.dwNumberOfProcessors;
     app.cpuCoreCount = cores;
-    
     if (cores <= 2) {
-        // Dual-core / Old architecture
-        app.crf = 30;
-        app.maxrate = 3000;
-        app.dynamicThreads = 1;
+        app.crf = 30; app.maxrate = 3000; app.dynamicThreads = 1;
     } else if (cores <= 4) {
-        // Quad-core / Mid-tier
-        app.crf = 28;
-        app.maxrate = 4000;
-        app.dynamicThreads = 2;
+        app.crf = 28; app.maxrate = 4000; app.dynamicThreads = 1;
     } else if (cores <= 8) {
-        // Modern 6-8 core
-        app.crf = 25;
-        app.maxrate = 6000;
-        app.dynamicThreads = 4;
+        app.crf = 25; app.maxrate = 6000; app.dynamicThreads = 4;
     } else {
-        // 12+ cores — no joke, deserves quality
-        app.crf = 20;
-        app.maxrate = 12000;
-        app.dynamicThreads = 8;
+        app.crf = 20; app.maxrate = 12000; app.dynamicThreads = 8;
     }
 }
 
@@ -169,6 +150,7 @@ bool RunFFmpeg(const std::string& cmd, PROCESS_INFORMATION* pi, DWORD flags) {
     return CreateProcessA(nullptr, cl.data(), nullptr, nullptr, FALSE,
         flags, nullptr, nullptr, &si, pi);
 }
+
 void SetStatus(const std::string& t) {
     if (app.lblStatus && IsWindow(app.lblStatus)) SetWindowTextA(app.lblStatus, t.c_str());
 }
@@ -176,19 +158,14 @@ void SetButton(const std::string& t) {
     if (app.btnRecord && IsWindow(app.btnRecord)) SetWindowTextA(app.btnRecord, t.c_str());
 }
 
-// Helper to get hotkey display name
 std::string GetHotkeyName() {
-    if (app.recordHotkey >= VK_F1 && app.recordHotkey <= VK_F12) {
+    if (app.recordHotkey >= VK_F1 && app.recordHotkey <= VK_F12)
         return "F" + std::to_string(app.recordHotkey - VK_F1 + 1);
-    } else if (app.recordHotkey >= VK_F13 && app.recordHotkey <= VK_F24) {
-        return "F" + std::to_string(app.recordHotkey - VK_F13 + 13);
-    }
-    return "F12";  // Fallback
+    return "F12";
 }
 
 void UpdateUI() {
     std::string hotkey = GetHotkeyName();
-    
     if (app.recording) {
         auto e = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - app.recStart).count();
@@ -206,7 +183,8 @@ void UpdateUI() {
         s += "\r\nCRF: " + std::to_string(app.crf);
         s += " | Bitrate: " + std::to_string(app.maxrate) + "k";
         s += "\r\n" + std::to_string(app.screenWidth) + "x" + std::to_string(app.screenHeight);
-        s += "\r\nMKV | DDAGrab | VFR";
+        s += "\r\nMJPEG | DDAGrab | VFR";
+        s += "\r\nBuilt by MaxRBLX1";
         if (app.sessions > 0) s += "\r\nSessions: " + std::to_string(app.sessions);
         SetStatus(s);
         SendMessage(app.progressBar, PBM_SETPOS, 0, 0);
@@ -220,35 +198,30 @@ void StartRecording() {
         MessageBoxA(app.hwnd, "ffmpeg.exe not found!", "RetroRec", MB_OK);
         return;
     }
-    
-    // Auto-detect current resolution BEFORE configuring pipeline
     DetectCurrentResolution();
-
     ConfigureUniversalPipeline();
     std::string ts = Timestamp();
+    app.tempFile = app.outputDir + "\\" + ts + "_temp.mkv";
     app.finalFile = app.outputDir + "\\" + ts + ".mkv";
-    
-    // Holy Grail Command with CRF matrix
+
     std::ostringstream c;
     c << "cmd.exe /c \"" 
       << "\"" << app.ffmpegPath << "\" -y -rtbufsize 2000M"
       << " -f lavfi -i ddagrab="
       << "framerate=60:video_size=" << app.screenWidth << "x" << app.screenHeight
-      << ":draw_mouse=1:output_idx=0:output_fmt=bgra:allow_fallback=1:dup_frames=1"
+      << ":draw_mouse=1:output_idx=0:output_fmt=bgra:allow_fallback=1:dup_frames=0"
       << " -max_muxing_queue_size 2048 -thread_queue_size 2048 -fps_mode vfr"
       << " -vf \"hwdownload,format=bgra,format=yuv420p\""
-      << " -c:v libx264 -preset ultrafast -crf " << app.crf
-      << " -maxrate " << app.maxrate << "k -bufsize " << app.maxrate << "k"
-      << " -pix_fmt yuv420p -g 600 -threads " << app.dynamicThreads
-      << " -x264-params \"sliced-threads=0:sync-lookahead=0:rc-lookahead=0:cabac=0:deblock=0:partitions=none\""
-      << " -f matroska \"" << app.finalFile << "\""
+      << " -c:v mjpeg -q:v 5"
+      << " -threads " << app.dynamicThreads
+      << " -f matroska \"" << app.tempFile << "\""
       << "\"";
-    
+
     if (!RunFFmpeg(c.str(), &app.ffmpegProcess, CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS)) {
         SetStatus("✗ Failed"); return;
     }
-    
-    SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
+
+    SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
     app.recording = true;
     app.recStart = std::chrono::steady_clock::now();
     app.sessions++;
@@ -261,26 +234,103 @@ void StopRecording() {
     if (!app.recording) return;
     KillTimer(app.hwnd, ID_TIMER_UPDATE);
     SendMessage(app.progressBar, PBM_SETMARQUEE, 0, 0);
-    SetStatus("⏳ Finalizing video file...");
-    
+    SetStatus("⏳ Finalizing...");
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - app.recStart).count();
+    app.lastRecordingDurationMs = (int)elapsed;
+    app.recording = false;
+
     if (app.ffmpegProcess.hProcess) {
         SetConsoleCtrlHandler(nullptr, TRUE);
         GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, app.ffmpegProcess.dwProcessId);
         DWORD wr = WaitForSingleObject(app.ffmpegProcess.hProcess, 6000);
-        if (wr == WAIT_TIMEOUT) {
-            TerminateProcess(app.ffmpegProcess.hProcess, 0);
-        }
+        if (wr == WAIT_TIMEOUT) TerminateProcess(app.ffmpegProcess.hProcess, 0);
         SetConsoleCtrlHandler(nullptr, FALSE);
         CloseHandle(app.ffmpegProcess.hProcess);
         CloseHandle(app.ffmpegProcess.hThread);
         app.ffmpegProcess.hProcess = nullptr;
         app.ffmpegProcess.hThread = nullptr;
     }
-    
+
     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
-    app.recording = false;
-    Sleep(800);
-    
+    Sleep(500);
+
+    if (FileExists(app.tempFile) && GetFileSize(app.tempFile) > 2048) {
+        std::string presetName = (app.convertPreset == 0) ? "fast" : "medium";
+        SetStatus("⏳ Converting (" + presetName + ")...");
+        SendMessage(app.progressBar, PBM_SETPOS, 0, 0);
+
+        HANDLE hRead, hWrite;
+        SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+        CreatePipe(&hRead, &hWrite, &sa, 0);
+        SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+        SYSTEM_INFO siCpu;
+        GetSystemInfo(&siCpu);
+        int conversionThreads = siCpu.dwNumberOfProcessors;
+
+        char cmdLine[4096];
+        sprintf_s(cmdLine, sizeof(cmdLine),
+            "cmd.exe /c \"\"%s\" -y -progress pipe:1 -loglevel error -i \"%s\" -c:v libx264 -preset %s -crf 23 -pix_fmt yuv420p -threads %d \"%s\"\"",
+            app.ffmpegPath.c_str(),
+            app.tempFile.c_str(),
+            presetName.c_str(),
+            conversionThreads,
+            app.finalFile.c_str()
+        );
+
+        STARTUPINFOA siConv = { sizeof(siConv) };
+        siConv.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+        siConv.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+        siConv.hStdOutput = hWrite;
+        siConv.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+        siConv.wShowWindow = SW_HIDE;
+
+        PROCESS_INFORMATION convertPI;
+
+        if (CreateProcessA(nullptr, cmdLine, nullptr, nullptr, TRUE,
+            CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
+            nullptr, nullptr, &siConv, &convertPI)) {
+
+            CloseHandle(hWrite);
+
+            char buf[512];
+            std::string lineBuffer;
+            DWORD bytesRead;
+            long long totalDurationUs = (long long)app.lastRecordingDurationMs * 1000;
+
+            while (ReadFile(hRead, buf, sizeof(buf) - 1, &bytesRead, NULL) && bytesRead > 0) {
+                buf[bytesRead] = '\0';
+                lineBuffer += buf;
+                size_t pos;
+                while ((pos = lineBuffer.find('\n')) != std::string::npos) {
+                    std::string oneLine = lineBuffer.substr(0, pos);
+                    lineBuffer = lineBuffer.substr(pos + 1);
+                    if (!oneLine.empty() && oneLine.back() == '\r') oneLine.pop_back();
+                    if (oneLine.find("out_time_ms=") == 0) {
+                        try {
+                            long long timeUs = std::stoll(oneLine.substr(12));
+                            int percent = (totalDurationUs > 0) ? (int)((timeUs * 100) / totalDurationUs) : 0;
+                            if (percent > 100) percent = 100;
+                            SendMessage(app.progressBar, PBM_SETPOS, percent, 0);
+                            SetStatus("⏳ Converting (" + presetName + ")... " + std::to_string(percent) + "%");
+                        } catch (...) {}
+                    }
+                }
+            }
+            CloseHandle(hRead);
+            WaitForSingleObject(convertPI.hProcess, INFINITE);
+            CloseHandle(convertPI.hProcess);
+            CloseHandle(convertPI.hThread);
+            DeleteFileA(app.tempFile.c_str());
+        } else {
+            CloseHandle(hRead);
+            CloseHandle(hWrite);
+            MoveFileA(app.tempFile.c_str(), app.finalFile.c_str());
+        }
+    }
+
     long long fs = GetFileSize(app.finalFile);
     if (fs > 2048) {
         app.totalBytes += fs;
@@ -302,41 +352,21 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             WS_VISIBLE|WS_CHILD|SS_LEFT, 20,90,340,130, h, nullptr, nullptr, nullptr);
         app.progressBar = CreateWindowA("msctls_progress32", "",
             WS_VISIBLE|WS_CHILD|PBS_MARQUEE, 20,235,340,15, h, nullptr, nullptr, nullptr);
-        
-        // Register custom hotkey
         RegisterHotKey(h, ID_HOTKEY_F12, app.hotkeyModifiers, app.recordHotkey);
-        
-        // Show current hotkey on button
-        std::string btnText = "▶ START (";
-        if (app.recordHotkey >= VK_F1 && app.recordHotkey <= VK_F12) {
-            btnText += "F" + std::to_string(app.recordHotkey - VK_F1 + 1) + ")";
-        } else {
-            btnText += "F12)";  // Fallback text
-        }
+        std::string btnText = "▶ START (" + GetHotkeyName() + ")";
         SetButton(btnText);
-        
         UpdateUI();
         return 0;
     }
-        
     case WM_COMMAND:
-        if (LOWORD(w) == ID_BTN_RECORD) { 
-            if (app.recording) StopRecording(); 
-            else StartRecording(); 
-        }
+        if (LOWORD(w) == ID_BTN_RECORD) { if (app.recording) StopRecording(); else StartRecording(); }
         return 0;
-        
     case WM_HOTKEY:
-        if (w == ID_HOTKEY_F12) { 
-            if (app.recording) StopRecording(); 
-            else StartRecording(); 
-        }
+        if (w == ID_HOTKEY_F12) { if (app.recording) StopRecording(); else StartRecording(); }
         return 0;
-        
     case WM_TIMER:
         if (w == ID_TIMER_UPDATE) UpdateUI();
         return 0;
-        
     case WM_DESTROY:
         if (app.recording) StopRecording();
         UnregisterHotKey(h, ID_HOTKEY_F12);
@@ -365,6 +395,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
         WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
         (GetSystemMetrics(SM_CXSCREEN)-w)/2, (GetSystemMetrics(SM_CYSCREEN)-h)/2,
         w, h, nullptr, nullptr, hInst, nullptr);
+    if (!app.hwnd) return 1;
     ShowWindow(app.hwnd, nCmdShow);
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
